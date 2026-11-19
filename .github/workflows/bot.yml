@@ -1,0 +1,75 @@
+name: SMC Pro MTF Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      data_file:
+        description: 'Chọn file dữ liệu CSV'
+        required: true
+        default: 'data/CEX_BTCUSD_1h.csv'
+        type: choice
+        options:
+          - data/CEX_BTCUSD_1h.csv
+          - data/CEX_BNBUSD_1h.csv
+      use_killzones:
+        description: 'Bật lọc phiên London/NY (Killzones)'
+        required: true
+        default: true
+        type: boolean
+      use_breakeven:
+        description: 'Bật dời SL về hòa vốn (Break-even)'
+        required: true
+        default: true
+        type: boolean
+  push:
+    branches: [ main ]
+    paths:
+      - '*.py'
+      - 'data/*.csv'
+
+permissions:
+  contents: write
+
+jobs:
+  run-backtest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run SMC Pro Backtest
+        run: |
+          DATA_ARG="${{ github.event.inputs.data_file || 'data/CEX_BTCUSD_1h.csv' }}"
+          KZ_FLAG="--killzones"
+          BE_FLAG="--breakeven"
+          
+          if [ "${{ github.event.inputs.use_killzones }}" == "false" ]; then
+            KZ_FLAG="--no-killzones"
+          fi
+          
+          if [ "${{ github.event.inputs.use_breakeven }}" == "false" ]; then
+            BE_FLAG="--no-breakeven"
+          fi
+          
+          rm -rf charts/*.png
+          python bot_smc_pro.py --data "$DATA_ARG" $KZ_FLAG $BE_FLAG
+
+      - name: Commit and push results
+        run: |
+          git config --local user.email "github-actions[bot]@://github.com"
+          git config --local user.name "github-actions[bot]"
+          git add backtest_results.csv backtest_summary.md charts/
+          git commit -m "chore: update SMC backtest results & charts [skip ci]" || exit 0
+          git push
