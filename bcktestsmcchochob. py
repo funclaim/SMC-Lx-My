@@ -1,0 +1,115 @@
+"""Đếm tần suất kèo/tuần (15m + HTF 4h), walk-forward trên file CSV.
+
+Cách dùng:   python backtest_freq.py data/
+  - Thư mục chứa mỗi cặp một file .csv (ví dụ BTC_USDT.csv)
+  - Cột bắt buộc: timestamp (ms/giây/ISO), open, high, low, close, volume
+  - Đặt file này cùng thư mục với smc_analysis.py và config.py
+Kết quả: bảng tóm tắt + signals.csv (mỗi dòng một kèo, tính lúc phát hiện đầu tiên).
+"""
+import glob
+import os
+import sys
+from multiprocessing import Pool
+
+import numpy as np
+import pandas as pd
+
+import smcchoch_analysis as smc
+
+LTF_WINDOW = 400   # số nến 15m đưa vào find_sweep_ob_setups
+HTF_WINDOW = 200   # số nến 4h đã đóng đưa vào analyze_htf_context_and_poi
+
+SCENARIOS = {
+    'HIEN_TAI':        dict(VOL_MULT=1.5, SWEEP_CLEAR_ATR=3.0, MIN_CHECKLIST_SCORE=75, REQUIRE_HTF_BOS=True),
+    'NOI_VOL_SWEEP':   dict(VOL_MULT=1.2, SWEEP_CLEAR_ATR=2.0, MIN_CHECKLIST_SCORE=75, REQUIRE_HTF_BOS=True),
+    'NOI_THEM_DIEM':   dict(VOL_MULT=1.2, SWEEP_CLEAR_ATR=2.0, MIN_CHECKLIST_SCORE=70, REQUIRE_HTF_BOS=True),
+    'BO_COT_BOS':      dict(VOL_MULT=1.2, SWEEP_CLEAR_ATR=2.0, MIN_CHECKLIST_SCORE=70, REQUIRE_HTF_BOS=False),
+    'KHONG_VOL_SWEEP': dict(VOL_MULT=0.0, SWEEP_CLEAR_ATR=0.0, MIN_CHECKLIST_SCORE=75, REQUIRE_HTF_BOS=True),
+}
+
+
+def load(path):
+    df = pd.read_csv(path)
+    df.columns = [c.strip().lower() for c in df.columns]
+    tcol = next(c for c in ('timestamp', 'datetime', 'date', 'time', 'open_time') if c in df.columns)
+    t = df[tcol]
+    if pd.api.types.is_numeric_dtype(t):
+        idx = pd.to_datetime(t, unit='ms' if t.iloc[0] > 1e11 else 's', utc=True)
+    else:
+        idx = pd.to_datetime(t, utc=True)
+    df = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
+    df.index = idx.dt.tz_localize(None)
+    df = df[~df.index.duplicated()].sort_index()
+    tr = pd.concat([df.high - df.low,
+                    (df.high - df.close.shift()).abs(),
+                    (df.low - df.close.shift()).abs()], axis=1).max(axis=1)
+    df['atr'] = tr.ewm(alpha=1 / 14, adjust=False).mean()   # ATR14 (Wilder)
+    return df
+
+
+def run_pair(path):
+    name = os.path.splitext(os.path.basename(path))[0]
+    df = load(path)
+    h = df.resample('4h').agg({'open': 'first', 'high': 'max', 'low': 'min',
+                               'close': 'last', 'volume': 'sum'}).dropna()
+    # số nến 4h đã đóng tại thời điểm nến 15m t đóng
+    h_end = (h.index + pd.Timedelta('4h')).values
+    n_closed = np.searchsorted(h_end, (df.index + pd.Timedelta('15min')).values, side='right')
+    lows, highs = df['low'].values, df['high'].values
+
+    seen = {s: set() for s in SCENARIOS}
+    rows = []
+    for t in range(LTF_WINDOW, len(df)):
+        nc = n_closed[t]
+        if nc < 30:
+            continue
+        trend, info = smc.analyze_htf_context_and_poi(
+            h.iloc[max(0, nc - HTF_WINDOW):nc], lows[t], highs[t])
+        if trend == 'NEUTRAL' or not info['touched_poi']:
+            continue
+        d = df.iloc[t - LTF_WINDOW + 1:t + 1]
+        for sname, params in SCENARIOS.items():
+            for k, v in params.items():
+                setattr(smc, k, v)
+            for s in smc.find_sweep_ob_setups(d, trend, info):
+                key = (s['direction'], s['ob_time'])
+                if key in seen[sname]:
+                    continue
+                seen[sname].add(key)
+                rows.append({'scenario': sname, 'pair': name, 'time': df.index[t],
+                             'direction': s['direction'], 'mode': s['entry_mode'],
+                             'score': s['score'], 'rr': s['rr'], 'entry': s['entry'],
+                             'sl': s['sl'], 'tp': s['tp']})
+    return rows, df.index[LTF_WINDOW], df.index[-1]
+
+
+def main(folder):
+    files = sorted(glob.glob(os.path.join(folder, '*.csv')))
+    if not files:
+        sys.exit(f'Không thấy file .csv trong {folder}')
+    with Pool(min(len(files), os.cpu_count() or 1)) as p:
+        results = p.map(run_pair, files)
+
+    rows = [r for part, _, _ in results for r in part]
+    start, end = min(r[1] for r in results), max(r[2] for r in results)
+    weeks = pd.period_range(start, end, freq='W')
+    sig = pd.DataFrame(rows, columns=['scenario', 'pair', 'time', 'direction', 'mode',
+                                      'score', 'rr', 'entry', 'sl', 'tp'])
+    sig['time'] = pd.to_datetime(sig['time'])
+    sig.to_csv('signals.csv', index=False)
+
+    print(f'{len(files)} cặp, {len(weeks)} tuần ({start.date()} → {end.date()})\n')
+    print(f'{"kịch bản":<16}{"tổng":>7}{"/tuần":>8}{"median":>8}{"%tuần≥3":>9}{"OB":>6}{"FVG":>6}')
+    for sname in SCENARIOS:
+        x = sig[sig.scenario == sname]
+        wk = (x['time'].dt.to_period('W').value_counts()
+              .reindex(weeks, fill_value=0))
+        print(f'{sname:<16}{len(x):>7}{len(x) / len(weeks):>8.2f}{wk.median():>8.1f}'
+              f'{(wk >= 3).mean() * 100:>8.0f}%{(x["mode"] == "OB").sum():>6}{(x["mode"] == "FVG").sum():>6}')
+
+    print('\nKèo theo cặp (HIEN_TAI):')
+    print(sig[sig.scenario == 'HIEN_TAI'].groupby('pair').size().to_string())
+
+
+if __name__ == '__main__':
+    main(sys.argv[1] if len(sys.argv) > 1 else 'data')
