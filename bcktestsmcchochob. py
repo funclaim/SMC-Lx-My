@@ -14,7 +14,7 @@ from multiprocessing import Pool
 import numpy as np
 import pandas as pd
 
-import smcchoch_analysis as smc
+import smc_analysis as smc
 
 LTF_WINDOW = 400   # số nến 15m đưa vào find_sweep_ob_setups
 HTF_WINDOW = 200   # số nến 4h đã đóng đưa vào analyze_htf_context_and_poi
@@ -58,19 +58,28 @@ def run_pair(path):
     lows, highs = df['low'].values, df['high'].values
 
     seen = {s: set() for s in SCENARIOS}
+    funnel = {s: {} for s in SCENARIOS}
+    g = {'buoc': 0, 'trend': 0, 'poi': 0, 'poi_bos': 0}
     rows = []
     for t in range(LTF_WINDOW, len(df)):
         nc = n_closed[t]
         if nc < 30:
             continue
+        g['buoc'] += 1
         trend, info = smc.analyze_htf_context_and_poi(
             h.iloc[max(0, nc - HTF_WINDOW):nc], lows[t], highs[t])
+        if trend != 'NEUTRAL':
+            g['trend'] += 1
+            if info['touched_poi']:
+                g['poi'] += 1
+                g['poi_bos'] += bool(info['has_bos'])
         if trend == 'NEUTRAL' or not info['touched_poi']:
             continue
         d = df.iloc[t - LTF_WINDOW + 1:t + 1]
         for sname, params in SCENARIOS.items():
             for k, v in params.items():
                 setattr(smc, k, v)
+            smc.STATS = funnel[sname]
             for s in smc.find_sweep_ob_setups(d, trend, info):
                 key = (s['direction'], s['ob_time'])
                 if key in seen[sname]:
@@ -80,7 +89,9 @@ def run_pair(path):
                              'direction': s['direction'], 'mode': s['entry_mode'],
                              'score': s['score'], 'rr': s['rr'], 'entry': s['entry'],
                              'sl': s['sl'], 'tp': s['tp']})
-    return rows, df.index[LTF_WINDOW], df.index[-1]
+    smc.STATS = None
+    fcount = {s: {k: len(v) for k, v in f.items()} for s, f in funnel.items()}
+    return rows, df.index[LTF_WINDOW], df.index[-1], g, fcount
 
 
 def main(folder):
@@ -90,7 +101,7 @@ def main(folder):
     with Pool(min(len(files), os.cpu_count() or 1)) as p:
         results = p.map(run_pair, files)
 
-    rows = [r for part, _, _ in results for r in part]
+    rows = [r for res in results for r in res[0]]
     start, end = min(r[1] for r in results), max(r[2] for r in results)
     weeks = pd.period_range(start, end, freq='W')
     sig = pd.DataFrame(rows, columns=['scenario', 'pair', 'time', 'direction', 'mode',
@@ -99,13 +110,28 @@ def main(folder):
     sig.to_csv('signals.csv', index=False)
 
     print(f'{len(files)} cặp, {len(weeks)} tuần ({start.date()} → {end.date()})\n')
-    print(f'{"kịch bản":<16}{"tổng":>7}{"/tuần":>8}{"median":>8}{"%tuần≥3":>9}{"OB":>6}{"FVG":>6}')
+    print(f'{"kịch bản":<16}{"tổng":>7}{"/tuần":>8}{"median":>8}{"%tuần≥3":>9}{"OB-limit":>10}{"FVG":>6}')
     for sname in SCENARIOS:
         x = sig[sig.scenario == sname]
         wk = (x['time'].dt.to_period('W').value_counts()
               .reindex(weeks, fill_value=0))
         print(f'{sname:<16}{len(x):>7}{len(x) / len(weeks):>8.2f}{wk.median():>8.1f}'
-              f'{(wk >= 3).mean() * 100:>8.0f}%{(x["mode"] == "OB").sum():>6}{(x["mode"] == "FVG").sum():>6}')
+              f'{(wk >= 3).mean() * 100:>8.0f}%{(x["mode"] != "FVG").sum():>10}{(x["mode"] == "FVG").sum():>6}')
+
+    g = {k: sum(res[3][k] for res in results) for k in results[0][3]}
+    print('\nCổng HTF (số bước 15m): '
+          f'tổng {g["buoc"]} → có xu hướng {g["trend"]} → chạm POI {g["poi"]} → có BOS {g["poi_bos"]}')
+    for sname in ('HIEN_TAI', 'KHONG_VOL_SWEEP'):
+        f = {}
+        for res in results:
+            for k, v in res[4][sname].items():
+                f[k] = f.get(k, 0) + v
+        print(f'\nPhễu LTF [{sname}] (số nến OB duy nhất qua từng bước):')
+        prev = None
+        for k in sorted(f, key=lambda x: int(x.split('_')[0])):
+            pct = '' if not prev else f'  ({f[k] / prev * 100:.0f}% bước trước)'
+            print(f'  {k:<26}{f[k]:>8}{pct}')
+            prev = f[k]
 
     print('\nKèo theo cặp (HIEN_TAI):')
     print(sig[sig.scenario == 'HIEN_TAI'].groupby('pair').size().to_string())
