@@ -214,4 +214,4 @@ def main(folder):
 
 
 if __name__ == '__main__':
-    main(sys.argv[1] if len(sys.argv) > 1 else 'data_15m')
+    main(sys.argv[1] if len(sys.argv) > 1 else 'data')
