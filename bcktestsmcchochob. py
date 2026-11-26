@@ -18,6 +18,9 @@ import smc_analysis as smc
 
 LTF_WINDOW = 400   # số nến 15m đưa vào find_sweep_ob_setups
 HTF_WINDOW = 200   # số nến 4h đã đóng đưa vào analyze_htf_context_and_poi
+FEE_RT = 0.001     # phí khứ hồi (0.10% = 0.05% x 2 chiều), tính vào R
+MAX_BARS = 200     # giữ lệnh tối đa (nến 15m), hết giờ thì đóng tại close
+DEDUP_BY_IDM = True  # mỗi IDM chỉ tính một kèo (tránh quét lại cùng IDM nhiều nến liên tiếp)
 
 SCENARIOS = {
     'HIEN_TAI':        dict(VOL_MULT=1.5, SWEEP_CLEAR_ATR=3.0, MIN_CHECKLIST_SCORE=75, REQUIRE_HTF_BOS=True),
@@ -56,6 +59,24 @@ def load(path):
     return df
 
 
+def simulate(highs, lows, closes, t, direction, entry, sl, tp):
+    """Vào tại close nến t. Duyệt nến sau: chạm SL/TP; cùng nến chạm cả hai thì tính SL."""
+    risk = abs(entry - sl)
+    long = direction == 'LONG'
+    last = min(len(highs) - 1, t + MAX_BARS)
+    for k in range(t + 1, last + 1):
+        if (lows[k] <= sl) if long else (highs[k] >= sl):
+            r, out = -1.0, 'SL'
+            break
+        if (highs[k] >= tp) if long else (lows[k] <= tp):
+            r, out = abs(tp - entry) / risk, 'TP'
+            break
+    else:
+        r = (closes[last] - entry) / risk * (1 if long else -1)
+        out = 'TIMEOUT'
+    return r - FEE_RT * entry / risk, out
+
+
 def run_pair(path):
     name = os.path.splitext(os.path.basename(path))[0]
     df = load(path)
@@ -64,7 +85,7 @@ def run_pair(path):
     # số nến 4h đã đóng tại thời điểm nến 15m t đóng
     h_end = (h.index + pd.Timedelta('4h')).values
     n_closed = np.searchsorted(h_end, (df.index + pd.Timedelta('15min')).values, side='right')
-    lows, highs = df['low'].values, df['high'].values
+    lows, highs, closes = df['low'].values, df['high'].values, df['close'].values
 
     seen = {s: set() for s in ALL}
     funnel = {s: {} for s in list(SCENARIOS) + ['TREND_LTF']}
@@ -104,17 +125,37 @@ def run_pair(path):
             for sname, gate in TREND_SCENARIOS.items():
                 if (gate['poi'] and not info['touched_poi']) or (gate['bos'] and not info['has_bos']):
                     continue
-                key = (s['direction'], s['sweep_time'])
+                key = (s['direction'], s['idm'] if DEDUP_BY_IDM else s['sweep_time'])
                 if key in seen[sname]:
                     continue
                 seen[sname].add(key)
+                r, out = simulate(highs, lows, closes, t, s['direction'], s['entry'], s['sl'], s['tp'])
                 rows.append({'scenario': sname, 'pair': name, 'time': df.index[t],
                              'direction': s['direction'], 'mode': 'TREND',
                              'score': np.nan, 'rr': s['rr'], 'entry': s['entry'],
-                             'sl': s['sl'], 'tp': s['tp']})
+                             'sl': s['sl'], 'tp': s['tp'], 'r': r, 'outcome': out})
     smc.STATS = None
     fcount = {s: {k: len(v) for k, v in f.items()} for s, f in funnel.items()}
     return rows, df.index[LTF_WINDOW], df.index[-1], g, fcount
+
+
+def print_sim(sig):
+    t = sig[sig['mode'] == 'TREND'].copy()
+    if t.empty:
+        return
+    print(f'\nMô phỏng (phí khứ hồi {FEE_RT * 100:.2f}%, tối đa {MAX_BARS} nến; cùng nến chạm SL và TP thì tính SL):')
+    print(f'{"kịch bản":<16}{"n":>6}{"win%":>7}{"avgR":>8}{"sumR":>9}{"PF":>7}{"TP":>6}{"SL":>6}{"hết giờ":>8}')
+    for sname in TREND_SCENARIOS:
+        x = t[t.scenario == sname]
+        if x.empty:
+            continue
+        pos, neg = x.r[x.r > 0].sum(), -x.r[x.r < 0].sum()
+        pf = pos / neg if neg > 0 else float('inf')
+        print(f'{sname:<16}{len(x):>6}{(x.r > 0).mean() * 100:>6.0f}%{x.r.mean():>8.2f}{x.r.sum():>9.1f}{pf:>7.2f}'
+              f'{(x.outcome == "TP").sum():>6}{(x.outcome == "SL").sum():>6}{(x.outcome == "TIMEOUT").sum():>8}')
+    t['nam'] = t['time'].dt.year
+    print('\nSố kèo / avgR theo năm:')
+    print(t.pivot_table(index='scenario', columns='nam', values='r', aggfunc=['count', 'mean']).round(2).to_string())
 
 
 def main(folder):
@@ -128,7 +169,7 @@ def main(folder):
     start, end = min(r[1] for r in results), max(r[2] for r in results)
     weeks = pd.period_range(start, end, freq='W')
     sig = pd.DataFrame(rows, columns=['scenario', 'pair', 'time', 'direction', 'mode',
-                                      'score', 'rr', 'entry', 'sl', 'tp'])
+                                      'score', 'rr', 'entry', 'sl', 'tp', 'r', 'outcome'])
     sig['time'] = pd.to_datetime(sig['time'])
     sig.to_csv('signals.csv', index=False)
 
@@ -140,6 +181,8 @@ def main(folder):
               .reindex(weeks, fill_value=0))
         print(f'{sname:<16}{len(x):>7}{len(x) / len(weeks):>8.2f}{wk.median():>8.1f}'
               f'{(wk >= 3).mean() * 100:>8.0f}%{x["mode"].isin(["WAIT", "OB"]).sum():>10}{(x["mode"] == "FVG").sum():>6}{(x["mode"] == "TREND").sum():>7}')
+
+    print_sim(sig)
 
     g = {k: sum(res[3][k] for res in results) for k in results[0][3]}
     print('\nCổng HTF (số bước 15m): '
