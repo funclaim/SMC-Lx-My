@@ -5,12 +5,18 @@ from config import SWING_SIZE, EQ_THRESHOLD, RR_RATIO
 MIN_CHECKLIST_SCORE = 75
 VOL_MULT = 1.5   # volume nến phá CHoCH >= VOL_MULT x TB 20 nến trước
 VOL_N = 20
+STATS = None             # backtest gán dict để đếm phễu; live để None
 REQUIRE_HTF_BOS = True   # hồi sau: chỉ đánh khi HTF đã BOS
 CHOCH_BODY_ATR = 0.5   # thân nến phá CHoCH >= N*ATR
 SWEEP_CLEAR_ATR = 3.0   # không còn swing chưa quét trong N*ATR sau đỉnh/đáy quét
 
 
 # ---------------------------------------------------------------- helpers
+def _hit(stage, key):
+    if STATS is not None:
+        STATS.setdefault(stage, set()).add(key)
+
+
 def _swings(h, l, size):
     """Swing high/low (NaN nếu không phải swing). Tương đương vòng for cũ."""
     w = 2 * size + 1
@@ -224,30 +230,37 @@ def find_sweep_ob_setups(df, trend, htf_info):
             ob_top, ob_bottom = highs_arr[i], lows_arr[i]
             if fvg_size >= (0.15 * atr):
                 l_pos, r_pos = bisect.bisect_left(lh_idxs, start_w), bisect.bisect_left(lh_idxs, i - 1)
+                _hit('1_ob_fvg', 'S' + ob_time)
                 p_hi = [x for x in range(l_pos, r_pos) if lh_vals[x] < ob_top]
                 p_highs = [lh_vals[x] for x in p_hi]
                 if len(p_highs) >= 2:
+                    _hit('2_hai_swing', 'S' + ob_time)
                     h1, h2 = p_highs[-2], p_highs[-1]
                     lq_level, sweep_high = max(h1, h2), max(highs_arr[i], highs_arr[i + 1])
+                    if sweep_high > lq_level:
+                        _hit('3_quet_tho', 'S' + ob_time)
                     if (sweep_high > lq_level
                             and closes_arr[i if highs_arr[i] >= highs_arr[i + 1] else i + 1] <= lq_level
                             and not has_liquidity_ahead(lh_idxs, lh_vals, suf_max, sweep_high,
                                                         SWEEP_CLEAR_ATR * atr, step, True)):
+                        _hit('4_quet_ro_rang', 'S' + ob_time)
                         idm = find_idm(lh_idxs, lh_vals, ll_idxs, ll_vals, closes_arr, i, start_w, True)
                         if idm is None:
                             continue
                         choch_idx, choch_lvl = idm
+                        _hit('5_co_idm', 'S' + ob_time)
                         fut_closes = closes_arr[i + 2: step + 1]
                         if fut_closes.min() < choch_lvl and fut_closes.max() <= sweep_high:
                             first_b = int(np.argmax(fut_closes < choch_lvl))
                             if first_b <= 12:
                                 b_pos = i + 2 + first_b
+                                _hit('6_dong_pha_idm_trong12', 'S' + ob_time)
                                 if not valid_choch_break(opens_arr, highs_arr, lows_arr, closes_arr, b_pos, atr, step, choch_lvl, True):
                                     continue
-                                if not valid_choch_break(opens_arr, highs_arr, lows_arr, closes_arr, b_pos, atr, step, choch_lvl, False):
-                                    continue
+                                _hit('7_pha_that', 'S' + ob_time)
                                 if not choch_volume_ok(vols_arr, b_pos):
                                     continue
+                                _hit('8_volume_ok', 'S' + ob_time)
                                 # fvg_bot = highs[i+2], fvg_top = lows[i]
                                 mode, j = fvg_reaction(lows_arr, highs_arr, closes_arr, b_pos, step,
                                                        highs_arr[i + 2], lows_arr[i], True)
@@ -255,6 +268,7 @@ def find_sweep_ob_setups(df, trend, htf_info):
                                     continue  # đã kích hoạt từ trước
                                 after_highs = highs_arr[b_pos + 1: step + 1]
                                 if mode == 'FVG' or len(after_highs) == 0 or after_highs.max() < ob_bottom:
+                                    _hit('9_entry_hop_le', 'S' + ob_time)
                                     if mode == 'FVG':
                                         entry = closes_arr[j]
                                         sl_p = max(highs_arr[j], sweep_high) + 0.2 * atr
@@ -264,12 +278,15 @@ def find_sweep_ob_setups(df, trend, htf_info):
                                     tp = nearest_liquidity(ll_idxs, ll_vals, suf_min, entry, step, True)
                                     if tp is None:
                                         continue
+                                    _hit('10_co_tp', 'S' + ob_time)
                                     rr = (entry - tp) / (sl_p - entry)
                                     if rr < RR_RATIO:
                                         continue
+                                    _hit('11_rr_dat', 'S' + ob_time)
                                     is_eq = abs(h1 - h2) <= EQ_THRESHOLD * atr
                                     score, detail = evaluate_smc_checklist(htf_info, entry, is_eq, fvg_size, atr, 'SHORT', rr)
                                     if score >= MIN_CHECKLIST_SCORE:
+                                        _hit('12_du_diem', 'S' + ob_time)
                                         setups.append({
                                             'direction': 'SHORT', 'index': i, 'ob_time': ob_time,
                                             'score': score, 'checklist': detail,
@@ -288,26 +305,37 @@ def find_sweep_ob_setups(df, trend, htf_info):
             ob_top, ob_bottom = highs_arr[i], lows_arr[i]
             if fvg_size >= (0.15 * atr):
                 l_pos, r_pos = bisect.bisect_left(ll_idxs, start_w), bisect.bisect_left(ll_idxs, i - 1)
+                _hit('1_ob_fvg', 'L' + ob_time)
                 p_lo = [x for x in range(l_pos, r_pos) if ll_vals[x] > ob_bottom]
                 p_lows = [ll_vals[x] for x in p_lo]
                 if len(p_lows) >= 2:
+                    _hit('2_hai_swing', 'L' + ob_time)
                     l1, l2 = p_lows[-2], p_lows[-1]
                     lq_level, sweep_low = min(l1, l2), min(lows_arr[i], lows_arr[i + 1])
+                    if sweep_low < lq_level:
+                        _hit('3_quet_tho', 'L' + ob_time)
                     if (sweep_low < lq_level
                             and closes_arr[i if lows_arr[i] <= lows_arr[i + 1] else i + 1] >= lq_level
                             and not has_liquidity_ahead(ll_idxs, ll_vals, suf_min, sweep_low,
                                                         SWEEP_CLEAR_ATR * atr, step, False)):
+                        _hit('4_quet_ro_rang', 'L' + ob_time)
                         idm = find_idm(ll_idxs, ll_vals, lh_idxs, lh_vals, closes_arr, i, start_w, False)
                         if idm is None:
                             continue
                         choch_idx, choch_lvl = idm
+                        _hit('5_co_idm', 'L' + ob_time)
                         fut_closes = closes_arr[i + 2: step + 1]
                         if fut_closes.max() > choch_lvl and fut_closes.min() >= sweep_low:
                             first_b = int(np.argmax(fut_closes > choch_lvl))
                             if first_b <= 12:
                                 b_pos = i + 2 + first_b
+                                _hit('6_dong_pha_idm_trong12', 'L' + ob_time)
+                                if not valid_choch_break(opens_arr, highs_arr, lows_arr, closes_arr, b_pos, atr, step, choch_lvl, False):
+                                    continue
+                                _hit('7_pha_that', 'L' + ob_time)
                                 if not choch_volume_ok(vols_arr, b_pos):
                                     continue
+                                _hit('8_volume_ok', 'L' + ob_time)
                                 # fvg_bot = highs[i], fvg_top = lows[i+2]
                                 mode, j = fvg_reaction(lows_arr, highs_arr, closes_arr, b_pos, step,
                                                        highs_arr[i], lows_arr[i + 2], False)
@@ -315,6 +343,7 @@ def find_sweep_ob_setups(df, trend, htf_info):
                                     continue  # đã kích hoạt từ trước
                                 after_lows = lows_arr[b_pos + 1: step + 1]
                                 if mode == 'FVG' or len(after_lows) == 0 or after_lows.min() > ob_top:
+                                    _hit('9_entry_hop_le', 'L' + ob_time)
                                     if mode == 'FVG':
                                         entry = closes_arr[j]
                                         sl_p = min(lows_arr[j], sweep_low) - 0.2 * atr
@@ -324,12 +353,15 @@ def find_sweep_ob_setups(df, trend, htf_info):
                                     tp = nearest_liquidity(lh_idxs, lh_vals, suf_max, entry, step, False)
                                     if tp is None:
                                         continue
+                                    _hit('10_co_tp', 'L' + ob_time)
                                     rr = (tp - entry) / (entry - sl_p)
                                     if rr < RR_RATIO:
                                         continue
+                                    _hit('11_rr_dat', 'L' + ob_time)
                                     is_eq = abs(l1 - l2) <= EQ_THRESHOLD * atr
                                     score, detail = evaluate_smc_checklist(htf_info, entry, is_eq, fvg_size, atr, 'LONG', rr)
                                     if score >= MIN_CHECKLIST_SCORE:
+                                        _hit('12_du_diem', 'L' + ob_time)
                                         setups.append({
                                             'direction': 'LONG', 'index': i, 'ob_time': ob_time,
                                             'score': score, 'checklist': detail,
