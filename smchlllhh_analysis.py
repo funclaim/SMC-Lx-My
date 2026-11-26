@@ -54,19 +54,19 @@ def has_liquidity_ahead(idxs, vals, suf, level, dist, step, short):
     return False
 
 
-def find_idm(bos_idxs, bos_vals, idm_idxs, idm_vals, closes, i, start_w, short):
-    """IDM hiện hành của cấu trúc trước nến i (đi tuần tự theo swing).
-    SHORT (cấu trúc tăng): đỉnh -> đáy đầu tiên sau đỉnh = IDM. Giá đóng cửa vượt đỉnh
-      (BOS) rồi tạo đáy mới CAO HƠN đáy cũ thì đáy mới là IDM mới. Đáy thấp hơn IDM = cấu
-      trúc gãy, dựng lại từ đầu.
-    LONG: đối xứng (đảo dấu).
-    Trả về None nếu chưa có IDM, hoặc IDM đã bị đóng cửa phá trước nến i.
-    Trả về (idx, level)."""
+def idm_chain(bos_idxs, bos_vals, idm_idxs, idm_vals, closes, i, start_w, short):
+    """Chuỗi IDM của cấu trúc trước nến i (đi tuần tự theo swing).
+    short=True : cấu trúc TĂNG (bos = swing high, idm = swing low) - dùng cho kèo SHORT đảo chiều.
+    short=False: cấu trúc GIẢM (bos = swing low, idm = swing high).
+    Đáy đầu tiên sau đỉnh = IDM; đóng cửa vượt đỉnh (BOS) rồi tạo đáy CAO hơn = IDM mới;
+    đáy thấp hơn IDM = cấu trúc gãy, dựng lại. Trả về ((idx, level), n_bos) hoặc (None, 0)
+    nếu chưa có IDM hoặc IDM đã bị đóng cửa phá trước nến i."""
     sg = 1.0 if short else -1.0
     c = sg * closes
     sw = sorted([(k, sg * v, 0) for k, v in zip(bos_idxs, bos_vals) if start_w <= k < i - 2] +
                 [(k, sg * v, 1) for k, v in zip(idm_idxs, idm_vals) if start_w <= k < i - 2])
     idm = ref = last_high = None      # idm=(idx,val); ref = đỉnh mà IDM hồi về từ đó
+    n_bos = 0
     for k, v, kind in sw:
         if kind == 0:
             last_high = (k, v)
@@ -74,14 +74,20 @@ def find_idm(bos_idxs, bos_vals, idm_idxs, idm_vals, closes, i, start_w, short):
         if last_high is None:         # đáy phải đứng sau một đỉnh
             continue
         if idm is None:
-            idm, ref = (k, v), last_high
+            idm, ref, n_bos = (k, v), last_high, 0
         elif v < idm[1]:              # đáy thấp hơn IDM: cấu trúc gãy
             idm = ref = last_high = None
+            n_bos = 0
         elif k > idm[0] and (c[idm[0] + 1:k] > ref[1]).any():   # BOS rồi đáy cao hơn
-            idm, ref = (k, v), last_high
+            idm, ref, n_bos = (k, v), last_high, n_bos + 1
     if idm is None or (c[idm[0] + 1:i] < idm[1]).any():
-        return None
-    return idm[0], sg * idm[1]
+        return None, 0
+    return (idm[0], sg * idm[1]), n_bos
+
+
+def find_idm(bos_idxs, bos_vals, idm_idxs, idm_vals, closes, i, start_w, short):
+    """IDM hiện hành (idx, level) hoặc None. Xem idm_chain."""
+    return idm_chain(bos_idxs, bos_vals, idm_idxs, idm_vals, closes, i, start_w, short)[0]
 
 
 def valid_choch_break(opens, highs, lows, closes, b, atr, step, lvl, short):
@@ -379,3 +385,63 @@ def find_sweep_ob_setups(df, trend, htf_info):
     # Ưu tiên duy nhất Extreme OB (cao nhất cho SHORT, thấp nhất cho LONG)
     extreme = max(setups, key=lambda x: x['ob_top']) if trend == 'BEARISH' else min(setups, key=lambda x: x['ob_bottom'])
     return [extreme]
+
+
+# ---------------------------------------------------------------- TREND (thuận sóng chính LTF)
+def find_trend_setups(df, trend):
+    """Kèo thuận sóng chính LTF: giá quét IDM (râu thủng) rồi nến đóng cửa lại ngoài IDM -> vào tại close.
+    BULLISH -> LONG: cấu trúc tăng đã có BOS + đáy cao hơn; IDM = đáy cao hơn gần nhất.
+    BEARISH -> SHORT: đối xứng. SL ngoài râu quét (+0.2 ATR), TP = swing chưa quét gần nhất, R:R >= RR_RATIO.
+    Chỉ báo ở nến vừa đóng (step). Lọc HTF (POI/BOS) để bên gọi quyết định."""
+    if trend not in ('BULLISH', 'BEARISH') or len(df) < 60:
+        return []
+    highs, lows, closes = df['high'].values, df['low'].values, df['close'].values
+    atr = df['atr'].values[-1]
+    if np.isnan(atr):
+        return []
+    step = len(df) - 1
+    start_w = max(0, step - 60)
+    sh, sl = _swings(highs, lows, 2)
+    lh_idxs = [k for k in np.where(~np.isnan(sh))[0] if k >= 2]
+    ll_idxs = [k for k in np.where(~np.isnan(sl))[0] if k >= 2]
+    lh_vals = [highs[k] for k in lh_idxs]
+    ll_vals = [lows[k] for k in ll_idxs]
+
+    long = trend == 'BULLISH'
+    key = ('L' if long else 'S') + str(df.index[step])
+    if long:
+        idm, n_bos = idm_chain(lh_idxs, lh_vals, ll_idxs, ll_vals, closes, step, start_w, True)
+    else:
+        idm, n_bos = idm_chain(ll_idxs, ll_vals, lh_idxs, lh_vals, closes, step, start_w, False)
+    if idm is None or n_bos < 1:
+        return []
+    _hit('T1_idm_sau_bos', key)
+    lvl = idm[1]
+    if not ((lows[step] < lvl) if long else (highs[step] > lvl)):
+        return []
+    _hit('T2_quet_idm', key)
+    if not ((closes[step] > lvl) if long else (closes[step] < lvl)):
+        return []
+    _hit('T3_dong_cua_lai', key)
+
+    entry = closes[step]
+    if long:
+        sl_p = lows[step] - 0.2 * atr
+        suf = np.maximum.accumulate(highs[::-1])[::-1]
+        tp = nearest_liquidity(lh_idxs, lh_vals, suf, entry, step, False)
+        rr = None if tp is None else (tp - entry) / (entry - sl_p)
+    else:
+        sl_p = highs[step] + 0.2 * atr
+        suf = np.minimum.accumulate(lows[::-1])[::-1]
+        tp = nearest_liquidity(ll_idxs, ll_vals, suf, entry, step, True)
+        rr = None if tp is None else (entry - tp) / (sl_p - entry)
+    if tp is None:
+        return []
+    _hit('T4_co_tp', key)
+    if rr < RR_RATIO:
+        return []
+    _hit('T5_rr_dat', key)
+    return [{'direction': 'LONG' if long else 'SHORT', 'mode': 'TREND',
+             'sweep_time': str(df.index[step]), 'entry': round(entry, 6),
+             'sl': round(sl_p, 6), 'tp': round(tp, 6), 'rr': round(rr, 2),
+             'idm': lvl, 'n_bos': n_bos}]
