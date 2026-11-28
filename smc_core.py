@@ -1,181 +1,319 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
 import numpy as np
 import pandas as pd
 
-def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    high_low = df['high'] - df['low']
-    high_close = np.abs(df['high'] - df['close'].shift())
-    low_close = np.abs(df['low'] - df['close'].shift())
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
 
-def detect_luxalgo_structure(df: pd.DataFrame, size: int = 5) -> pd.DataFrame:
+class TrendState(str, Enum):
+    BULLISH = "BULLISH"
+    BEARISH = "BEARISH"
+    SIDEWAY = "SIDEWAY"
+    UNKNOWN = "UNKNOWN"
+
+
+class SidewayType(str, Enum):
+    NONE = "NONE"
+    ACCUMULATION = "ACCUMULATION"   # Quy ước cá nhân: vùng thấp / discount (mặc định <= 0.36)
+    DISTRIBUTION = "DISTRIBUTION"   # Quy ước cá nhân: vùng cao / premium (mặc định >= 0.65)
+
+
+class StructureEventType(str, Enum):
+    BOS_BULL = "BOS_BULL"
+    BOS_BEAR = "BOS_BEAR"
+    CHOCH_BULL = "CHOCH_BULL"
+    CHOCH_BEAR = "CHOCH_BEAR"
+
+
+@dataclass
+class SwingPoint:
+    idx: int
+    confirmed_idx: int
+    kind: str             # "HIGH" hoặc "LOW"
+    price: float
+    label: str = ""       # "HH", "HL", "LH", "LL"
+
+
+@dataclass
+class StructureEvent:
+    event_idx: int
+    event_type: StructureEventType
+    broken_swing: SwingPoint
+    break_price: float
+
+
+@dataclass
+class ValidPullbackIDM:
+    direction: str          # "BULL" hoặc "BEAR"
+    level: float
+    formed_idx: int
+    retrace_size: float = 0.0
+    atr_at_form: float = 0.0
+    swept: bool = False
+    swept_idx: int | None = None
+
+
+@dataclass
+class LiquidityZone:
+    kind: str               # "EQH", "EQL", "SWING_HIGH", "SWING_LOW"
+    price: float
+    formed_idx: int
+    member_indices: list[int]
+    swept: bool = False
+    swept_idx: int | None = None
+
+
+@dataclass
+class ZoneOB:
+    direction: str          # "BULL" hoặc "BEAR"
+    role: str               # "OB" hoặc "OB_EX"
+    candle_idx: int
+    top: float
+    bottom: float
+    impulse_origin_idx: int
+
+
+def compute_atr(df: pd.DataFrame, period: int = 14) -> np.ndarray:
+    """Tính ATR dùng chung cho toàn bộ module."""
+    highs = df["high"].to_numpy(dtype=float)
+    lows = df["low"].to_numpy(dtype=float)
+    closes = df["close"].to_numpy(dtype=float)
+    prev_closes = np.roll(closes, 1)
+
+    tr = np.maximum(
+        highs - lows,
+        np.maximum(np.abs(highs - prev_closes), np.abs(lows - prev_closes)),
+    )
+    if len(tr) > 0:
+        tr[0] = highs[0] - lows[0]
+    return pd.Series(tr, index=df.index).rolling(period, min_periods=1).mean().to_numpy()
+
+
+def is_valid_idm(retrace_size: float, atr_val: float, min_atr_mult: float = 0.6) -> bool:
+    """Lọc nhiễu: nhịp hồi/IDM hợp lệ khi đạt độ lớn tối thiểu theo ATR."""
+    return atr_val > 0 and retrace_size >= (min_atr_mult * atr_val)
+
+
+def detect_confirmed_swings(df: pd.DataFrame, k: int = 2) -> list[SwingPoint]:
     """
-    Chuyển đổi chính xác hàm leg(size) và getCurrentStructure của LuxAlgo.
-    Lưu ý: Pivot tại index [i - size] chỉ được xác nhận tại thời điểm [i] để tránh repaint.
+    Duyệt từ trái -> phải (0 -> N-1).
+    Swing tại pivot = i - k chỉ được xác nhận tại nến i (tránh look-ahead).
     """
-    df = df.copy()
-    n = len(df)
-    leg = np.zeros(n, dtype=int)
-    
-    highs = df['high'].values
-    lows = df['low'].values
-    
-    # Tính toán leg(size) giống Pine Script:
-    # newLegHigh = high[size] > ta.highest(size)
-    # newLegLow  = low[size]  < ta.lowest(size)
-    for i in range(size, n):
-        window_high = np.max(highs[i - size + 1 : i + 1])
-        window_low = np.min(lows[i - size + 1 : i + 1])
-        
-        if highs[i - size] > window_high:
-            leg[i] = 0  # Bearish leg bắt đầu (tạo đỉnh)
-        elif lows[i - size] < window_low:
-            leg[i] = 1  # Bullish leg bắt đầu (tạo đáy)
+    highs = df["high"].to_numpy(dtype=float)
+    lows = df["low"].to_numpy(dtype=float)
+    swings: list[SwingPoint] = []
+
+    if len(df) < 2 * k + 1:
+        return swings
+
+    for i in range(2 * k, len(df)):
+        pivot = i - k
+        if highs[pivot] > np.max(highs[pivot - k : pivot]) and highs[pivot] >= np.max(highs[pivot + 1 : i + 1]):
+            swings.append(SwingPoint(idx=pivot, confirmed_idx=i, kind="HIGH", price=float(highs[pivot])))
+        if lows[pivot] < np.min(lows[pivot - k : pivot]) and lows[pivot] <= np.min(lows[pivot + 1 : i + 1]):
+            swings.append(SwingPoint(idx=pivot, confirmed_idx=i, kind="LOW", price=float(lows[pivot])))
+
+    swings.sort(key=lambda s: (s.confirmed_idx, s.idx))
+
+    last_high: float | None = None
+    last_low: float | None = None
+    for sw in swings:
+        if sw.kind == "HIGH":
+            if last_high is not None:
+                sw.label = "HH" if sw.price > last_high else "LH"
+            last_high = sw.price
         else:
-            leg[i] = leg[i - 1]
-            
-    df['leg'] = leg
-    df['new_pivot'] = df['leg'] != df['leg'].shift(1)
-    df['pivot_low_confirmed'] = df['new_pivot'] & (df['leg'] == 1)
-    df['pivot_high_confirmed'] = df['new_pivot'] & (df['leg'] == 0)
-    
-    # Giá trị thực tế của đỉnh/đáy nằm ở nến [i - size]
-    df['confirmed_low_price'] = np.where(df['pivot_low_confirmed'], df['low'].shift(size), np.nan)
-    df['confirmed_low_idx'] = np.where(df['pivot_low_confirmed'], df.index.shift(size) if isinstance(df.index, pd.RangeIndex) else np.arange(n) - size, np.nan)
-    
-    df['confirmed_high_price'] = np.where(df['pivot_high_confirmed'], df['high'].shift(size), np.nan)
-    df['confirmed_high_idx'] = np.where(df['pivot_high_confirmed'], np.arange(n) - size, np.nan)
-    
-    return df
+            if last_low is not None:
+                sw.label = "HL" if sw.price > last_low else "LL"
+            last_low = sw.price
 
-def analyze_htf_smc(df_4h: pd.DataFrame, swing_size: int = 10, internal_size: int = 3) -> pd.DataFrame:
+    return swings
+
+
+def classify_range_position(
+    df: pd.DataFrame,
+    current_idx: int,
+    window: int = 50,
+    discount_max: float = 0.36,
+    premium_min: float = 0.65,
+) -> tuple[SidewayType, float]:
+    """Đánh giá vị trí giá đóng cửa trong biên độ [current_idx - window + 1 .. current_idx]."""
+    start_idx = max(0, current_idx - window + 1)
+    sub = df.iloc[start_idx : current_idx + 1]
+    r_high = float(sub["high"].max())
+    r_low = float(sub["low"].min())
+    close_price = float(df["close"].iloc[current_idx])
+
+    if r_high <= r_low:
+        return SidewayType.NONE, 0.5
+
+    pos = (close_price - r_low) / (r_high - r_low)
+    if pos <= discount_max:
+        return SidewayType.ACCUMULATION, pos
+    if pos >= premium_min:
+        return SidewayType.DISTRIBUTION, pos
+    return SidewayType.NONE, pos
+
+
+def detect_eq_zones(
+    df: pd.DataFrame,
+    swings: list[SwingPoint],
+    atr: np.ndarray,
+    tol_atr_mult: float = 0.1,
+) -> list[LiquidityZone]:
+    """Tìm cụm EQH / EQL theo độ lệch <= tol_atr_mult * ATR."""
+    zones: list[LiquidityZone] = []
+    last_h: SwingPoint | None = None
+    last_l: SwingPoint | None = None
+
+    for sw in swings:
+        tol = tol_atr_mult * float(atr[sw.idx])
+        if sw.kind == "HIGH":
+            if last_h is not None and abs(sw.price - last_h.price) <= tol:
+                zones.append(
+                    LiquidityZone(
+                        kind="EQH",
+                        price=(sw.price + last_h.price) / 2.0,
+                        formed_idx=sw.idx,
+                        member_indices=[last_h.idx, sw.idx],
+                    )
+                )
+            last_h = sw
+        else:
+            if last_l is not None and abs(sw.price - last_l.price) <= tol:
+                zones.append(
+                    LiquidityZone(
+                        kind="EQL",
+                        price=(sw.price + last_l.price) / 2.0,
+                        formed_idx=sw.idx,
+                        member_indices=[last_l.idx, sw.idx],
+                    )
+                )
+            last_l = sw
+
+    return zones
+
+
+def track_structure_and_liquidity(
+    df: pd.DataFrame,
+    swings: list[SwingPoint],
+    zones: list[LiquidityZone],
+    atr: np.ndarray,
+    min_idm_atr_mult: float = 0.6,
+) -> tuple[list[StructureEvent], list[ValidPullbackIDM], list[LiquidityZone], TrendState]:
     """
-    Phân tích 4 yêu cầu trên khung HTF-4H:
-    1. Cấu trúc: Bull, Bear, Sideway (Tích lũy / Phân phối)
-    2. Xác nhận đỉnh/đáy qua việc quét IDM (Internal Swing)
-    3. Xác định OB (kèm FVG, Volume > 1.5x trung bình, vị trí Premium/Discount)
-    4. Xác định vùng thanh khoản đối diện (BSL / SSL)
+    Duyệt từ trái -> phải (0 -> N-1): cập nhật LQ Sweep, BOS/CHOCH, IDM hợp lệ và Trend.
     """
-    df = df_4h.copy()
-    df['atr'] = calculate_atr(df, 14)
-    df['vol_ma'] = df['volume'].rolling(10).mean()
-    df['high_volume'] = df['volume'] > (df['vol_ma'] * 1.5) # Volume lớn hơn 50% nến kế bên
-    
-    # Tính cấu trúc Swing (chính) và Internal (dùng làm IDM)
-    swing_df = detect_luxalgo_structure(df, size=swing_size)
-    internal_df = detect_luxalgo_structure(df, size=internal_size)
-    
-    df['swing_high'] = swing_df['confirmed_high_price']
-    df['swing_low'] = swing_df['confirmed_low_price']
-    df['internal_high'] = internal_df['confirmed_high_price']
-    df['internal_low'] = internal_df['confirmed_low_price']
-    
-    # FVG Detection (Bullish & Bearish)
-    df['bull_fvg'] = df['low'] > df['high'].shift(2)
-    df['bear_fvg'] = df['high'] < df['low'].shift(2)
-    
-    # Lưu trạng thái cấu trúc theo từng nến
-    trends = []
-    wyckoff_phases = []
-    active_obs = [] # Danh sách OB hợp lệ tại thời điểm i
-    
-    current_trend = 'SIDEWAY'
-    last_sh, prev_sh = np.nan, np.nan
-    last_sl, prev_sl = np.nan, np.nan
-    last_idm_high, last_idm_low = np.nan, np.nan
-    idm_swept = False
-    
-    current_ob = None # Dict lưu OB mạnh hiện tại
-    
+    highs = df["high"].to_numpy(dtype=float)
+    lows = df["low"].to_numpy(dtype=float)
+    closes = df["close"].to_numpy(dtype=float)
+
+    swings_by_confirm: dict[int, list[SwingPoint]] = {}
+    for sw in swings:
+        swings_by_confirm.setdefault(sw.confirmed_idx, []).append(sw)
+
+    last_conf_h: SwingPoint | None = None
+    last_conf_l: SwingPoint | None = None
+    broken_ids: set[int] = set()
+
+    trend = TrendState.UNKNOWN
+    events: list[StructureEvent] = []
+    idms: list[ValidPullbackIDM] = []
+    active_idm: ValidPullbackIDM | None = None
+
     for i in range(len(df)):
-        row = df.iloc[i]
-        
-        # Cập nhật Internal Structure (IDM)
-        if not np.isnan(row['internal_high']):
-            last_idm_high = row['internal_high']
-        if not np.isnan(row['internal_low']):
-            last_idm_low = row['internal_low']
-            
-        # Cập nhật Swing Structure
-        if not np.isnan(row['swing_high']):
-            prev_sh = last_sh
-            last_sh = row['swing_high']
-            idm_swept = False # Reset trạng thái quét IDM khi có đỉnh mới
-            
-        if not np.isnan(row['swing_low']):
-            prev_sl = last_sl
-            last_sl = row['swing_low']
-            idm_swept = False
+        # 1. Liquidity Sweep
+        for z in zones:
+            if not z.swept and i > z.formed_idx:
+                if z.kind in ("EQH", "SWING_HIGH") and highs[i] > z.price and closes[i] < z.price:
+                    z.swept, z.swept_idx = True, i
+                elif z.kind in ("EQL", "SWING_LOW") and lows[i] < z.price and closes[i] > z.price:
+                    z.swept, z.swept_idx = True, i
 
-        # 1. Xác định xu hướng (Bull / Bear / Sideway)
-        if not np.isnan(last_sh) and not np.isnan(prev_sh) and not np.isnan(last_sl) and not np.isnan(prev_sl):
-            if last_sh > prev_sh and last_sl > prev_sl:
-                current_trend = 'BULL'
-            elif last_sh < prev_sh and last_sl < prev_sl:
-                current_trend = 'BEAR'
+        # 2. Swing được xác nhận tại nến i -> tạo IDM hợp lệ nếu đủ độ lớn
+        for sw in swings_by_confirm.get(i, []):
+            atr_val = float(atr[sw.idx])
+            if sw.kind == "HIGH":
+                if last_conf_l is not None and trend == TrendState.BEARISH:
+                    retrace = abs(sw.price - float(lows[last_conf_l.idx]))
+                    if is_valid_idm(retrace, atr_val, min_idm_atr_mult):
+                        active_idm = ValidPullbackIDM("BEAR", sw.price, sw.idx, retrace, atr_val)
+                        idms.append(active_idm)
+                last_conf_h = sw
             else:
-                current_trend = 'SIDEWAY'
-                
-        # Phân loại Sideway: Tích lũy (Accumulation) hay Phân phối (Distribution)
-        phase = 'NONE'
-        if current_trend == 'SIDEWAY' and not np.isnan(last_sh) and not np.isnan(last_sl):
-            mid_range = (last_sh + last_sl) / 2
-            # Nếu giá giữ trên 50% biên độ kèm volume tăng ở đáy -> Tích lũy, ngược lại -> Phân phối
-            if row['close'] < mid_range and row['high_volume']:
-                phase = 'ACCUMULATION'
-            elif row['close'] > mid_range and row['high_volume']:
-                phase = 'DISTRIBUTION'
-                
-        # 2. Kiểm tra quét IDM để xác nhận đỉnh/đáy
-        if current_trend == 'BULL' and not np.isnan(last_idm_low):
-            if row['low'] < last_idm_low:
-                idm_swept = True # Giá hồi về quét IDM -> Đỉnh last_sh chính thức được xác nhận
-        elif current_trend == 'BEAR' and not np.isnan(last_idm_high):
-            if row['high'] > last_idm_high:
-                idm_swept = True # Giá hồi lên quét IDM -> Đáy last_sl chính thức được xác nhận
+                if last_conf_h is not None and trend == TrendState.BULLISH:
+                    retrace = abs(float(highs[last_conf_h.idx]) - sw.price)
+                    if is_valid_idm(retrace, atr_val, min_idm_atr_mult):
+                        active_idm = ValidPullbackIDM("BULL", sw.price, sw.idx, retrace, atr_val)
+                        idms.append(active_idm)
+                last_conf_l = sw
 
-        # 3. Tìm OB mạnh (sau khi quét IDM, có FVG, Volume > 50%, nằm vùng Discount/Premium)
-        if idm_swept and i >= 2 and not np.isnan(last_sh) and not np.isnan(last_sl):
-            equilibrium = (last_sh + last_sl) / 2
-            
-            # Tìm Bullish OB (Nằm vùng rẻ Discount < Equilibrium)
-            if current_trend == 'BULL' and row['bull_fvg'] and df.iloc[i-1]['high_volume']:
-                ob_candle = df.iloc[i-2]
-                if ob_candle['high'] < equilibrium:
-                    current_ob = {
-                        'type': 'BULL_OB',
-                        'top': ob_candle['high'],
-                        'bottom': ob_candle['low'],
-                        'tp_target': last_sh, # BSL đối diện
-                        'created_idx': i,
-                        'atr': row['atr']
-                    }
-                    
-            # Tìm Bearish OB (Nằm vùng mắc Premium > Equilibrium)
-            elif current_trend == 'BEAR' and row['bear_fvg'] and df.iloc[i-1]['high_volume']:
-                ob_candle = df.iloc[i-2]
-                if ob_candle['low'] > equilibrium:
-                    current_ob = {
-                        'type': 'BEAR_OB',
-                        'top': ob_candle['high'],
-                        'bottom': ob_candle['low'],
-                        'tp_target': last_sl, # SSL đối diện
-                        'created_idx': i,
-                        'atr': row['atr']
-                    }
-                    
-        # Vô hiệu hóa OB nếu giá đóng cửa xuyên thủng hoàn toàn
-        if current_ob is not None:
-            if current_ob['type'] == 'BULL_OB' and row['close'] < current_ob['bottom']:
-                current_ob = None
-            elif current_ob['type'] == 'BEAR_OB' and row['close'] > current_ob['top']:
-                current_ob = None
+        # 3. Kiểm tra quét IDM
+        if active_idm is not None and not active_idm.swept:
+            if active_idm.direction == "BULL" and lows[i] < active_idm.level:
+                active_idm.swept, active_idm.swept_idx = True, i
+            elif active_idm.direction == "BEAR" and highs[i] > active_idm.level:
+                active_idm.swept, active_idm.swept_idx = True, i
 
-        trends.append(current_trend)
-        wyckoff_phases.append(phase)
-        active_obs.append(current_ob.copy() if current_ob else None)
-        
-    df['htf_trend'] = trends
-    df['wyckoff_phase'] = wyckoff_phases
-    df['active_ob'] = active_obs
-    return df
+        # 4. BOS / CHOCH bằng giá đóng cửa
+        c = float(closes[i])
+        if last_conf_h is not None and id(last_conf_h) not in broken_ids and c > last_conf_h.price:
+            broken_ids.add(id(last_conf_h))
+            ev_type = StructureEventType.CHOCH_BULL if trend == TrendState.BEARISH else StructureEventType.BOS_BULL
+            trend = TrendState.BULLISH
+            events.append(StructureEvent(i, ev_type, last_conf_h, c))
+
+        if last_conf_l is not None and id(last_conf_l) not in broken_ids and c < last_conf_l.price:
+            broken_ids.add(id(last_conf_l))
+            ev_type = StructureEventType.CHOCH_BEAR if trend == TrendState.BULLISH else StructureEventType.BOS_BEAR
+            trend = TrendState.BEARISH
+            events.append(StructureEvent(i, ev_type, last_conf_l, c))
+
+    return events, idms, zones, trend
+
+
+def find_origin_and_obs_backward(
+    df: pd.DataFrame,
+    current_idx: int,
+    direction: str,
+    swing_indices: list[int],
+    max_candle_steps: int = 10,
+    max_lookback_bars: int = 150,
+) -> tuple[ZoneOB | None, ZoneOB | None]:
+    """
+    Quét từ phải -> trái (current_idx lùi về quá khứ) để lấy OB và OB_EX.
+    """
+    opens = df["open"].to_numpy(dtype=float)
+    closes = df["close"].to_numpy(dtype=float)
+    highs = df["high"].to_numpy(dtype=float)
+    lows = df["low"].to_numpy(dtype=float)
+
+    def _pick_opposing_candle(origin_idx: int) -> int | None:
+        low_bound = max(0, origin_idx - max_candle_steps)
+        for j in range(origin_idx, low_bound - 1, -1):
+            if direction == "BULL" and closes[j] < opens[j]:
+                return j
+            if direction == "BEAR" and closes[j] > opens[j]:
+                return j
+        return None
+
+    min_bar = max(0, current_idx - max_lookback_bars)
+    past_origins = sorted([idx for idx in swing_indices if min_bar <= idx < current_idx])
+    if not past_origins:
+        return None, None
+
+    nearest_ob: ZoneOB | None = None
+    latest_origin = past_origins[-1]
+    ob_idx = _pick_opposing_candle(latest_origin)
+    if ob_idx is not None:
+        nearest_ob = ZoneOB(direction, "OB", ob_idx, float(highs[ob_idx]), float(lows[ob_idx]), latest_origin)
+
+    extreme_ob: ZoneOB | None = None
+    for origin_idx in past_origins:
+        ex_idx = _pick_opposing_candle(origin_idx)
+        if ex_idx is not None:
+            extreme_ob = ZoneOB(direction, "OB_EX", ex_idx, float(highs[ex_idx]), float(lows[ex_idx]), origin_idx)
+            break
+
+    return nearest_ob, extreme_ob
