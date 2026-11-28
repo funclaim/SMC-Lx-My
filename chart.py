@@ -1,3 +1,4 @@
+# sử dụng cho smc_score mới
 from __future__ import annotations
 
 import matplotlib.pyplot as plt
