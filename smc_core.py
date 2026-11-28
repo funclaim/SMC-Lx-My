@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+# smc mới chỉ định ngĩa
 from dataclasses import dataclass
 from enum import Enum
 import numpy as np
